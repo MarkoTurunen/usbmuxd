@@ -571,8 +571,8 @@ static int enum_step(struct kisrsm_dev *dev, int index)
 	case 4: return control(dev, 0xC0, 0x52, 0, 3, 1);        /* Apple set mode 3, as macOS */
 	case 5: return control(dev, 0x00, 0x09, 1, 0, 0);        /* SET_CONFIGURATION 1 */
 	case 6: return control(dev, 0x80, 0x06, 0x0300 | dev->devdesc.iSerialNumber, 0x0409, 255);
+	default: return 0;
 	}
-	return 0;
 }
 #define N_ENUM 7
 
@@ -603,6 +603,8 @@ static void enum_done(struct kisrsm_dev *dev, int index)
 	case 6:
 		ascii_string(dev->ctrl_data, dev->ctrl_len, dev->serial, sizeof(dev->serial));
 		usbmuxd_log(LL_INFO, "KIS RSM: restore device serial %s", dev->serial);
+		break;
+	default:
 		break;
 	}
 }

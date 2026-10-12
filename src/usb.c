@@ -1177,6 +1177,7 @@ int usb_process_timeout(int msec)
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
 static libusb_hotplug_callback_handle usb_hotplug_cb_handle;
+static libusb_hotplug_callback_handle kis_hotplug_cb_handle;
 
 static int usb_hotplug_cb(libusb_context *ctx, libusb_device *device, libusb_hotplug_event event, void *user_data)
 {
@@ -1237,6 +1238,13 @@ int usb_init(void)
 		res = libusb_hotplug_register_callback(NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, LIBUSB_HOTPLUG_ENUMERATE, VID_APPLE, LIBUSB_HOTPLUG_MATCH_ANY, 0, usb_hotplug_cb, NULL, &usb_hotplug_cb_handle);
 		if (res == LIBUSB_SUCCESS) {
 			device_polling = 0;
+			/* The callback above only matches device class 0; the KIS device is vendor class (0xff). */
+			res = libusb_hotplug_register_callback(NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, LIBUSB_HOTPLUG_ENUMERATE, VID_APPLE, KIS_PRODUCT_ID, LIBUSB_HOTPLUG_MATCH_ANY, usb_hotplug_cb, NULL, &kis_hotplug_cb_handle);
+			if (res != LIBUSB_SUCCESS) {
+				usbmuxd_log(LL_ERROR, "ERROR: Could not register for libusb hotplug events of KIS devices. %s", libusb_error_name(res));
+				libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
+				device_polling = 1;
+			}
 		} else {
 			usbmuxd_log(LL_ERROR, "ERROR: Could not register for libusb hotplug events. %s", libusb_error_name(res));
 		}
@@ -1259,7 +1267,10 @@ void usb_shutdown(void)
 	usbmuxd_log(LL_DEBUG, "usb_shutdown");
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
-	libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
+	if (!device_polling) {
+		libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
+		libusb_hotplug_deregister_callback(NULL, kis_hotplug_cb_handle);
+	}
 #endif
 
 	FOREACH(struct kis_candidate *c, &kis_list) {
