@@ -18,7 +18,7 @@
  *   0x81 device: command reply [0x18000 | cmd, ...] or port event [0x18, port, status]
  *   0x84 both: transfer records [code, endpoint id, length, 0]
  *        0x1000 host: queue a transfer (IN read / control data stage)
- *        0x1000 device: credit (ep 0: ready for SETUP; OUT endpoint: one transfer)
+ *        0x1000 device: credit (ep 0: ready for SETUP; OUT endpoint: one transfer of up to length)
  *        0x?1005 device: control transfer complete (status in bits 16-19, 1 = ok)
  *   addr << 4 | ep       host: SETUP (ep 0) or bulk OUT data
  *   0x40 | addr << 4 | ep device: IN data (completes one queued read)
@@ -64,7 +64,8 @@
 
 #define DEV_ADDR         1      /* the restore device's address on the virtual port */
 #define PORT             1
-#define BULK_CHUNK       0x8000 /* credits are one transfer of up to 32 KB */
+#define BULK_CHUNK       0x8000 /* largest OUT entry, also when a credit allows more */
+#define MAX_CREDITS      64
 #define IN_READS         4
 #define IN_READ_SIZE     0x8000
 #define STEP_TIMEOUT_MS  5000
@@ -125,8 +126,11 @@ struct kisrsm_dev {
 	uint8_t ep_out, ep_in;
 	uint16_t config_total;
 
-	/* bulk */
-	int out_credits;
+	/* bulk: OUT credits in the order the device granted them, each one transfer of up to its length */
+	uint32_t credit_len[MAX_CREDITS];
+	int credit_head, out_credits;
+	uint32_t last_credit_len;
+	int unhandled_logged;
 	int in_queued;
 	struct txbuf *tx_head, *tx_tail;
 	kisrsm_rx_cb rx_cb;
@@ -357,15 +361,26 @@ static void handle_record(struct kisrsm_dev *dev, uint8_t cls, const unsigned ch
 		} else if (w0 == 0x1000) {
 			if (w1 == DEV_ADDR)
 				dev->ep0_credit = 1;
-			else if (dev->ep_out && w1 == ep_out_id)
-				dev->out_credits++;
+			else if (dev->ep_out && w1 == ep_out_id) {
+				if (w2 != dev->last_credit_len) {
+					usbmuxd_log(LL_INFO, "KIS RSM: OUT credit length %u", w2);
+					dev->last_credit_len = w2;
+				}
+				if (dev->out_credits < MAX_CREDITS) {
+					dev->credit_len[(dev->credit_head + dev->out_credits) % MAX_CREDITS] = w2;
+					dev->out_credits++;
+				}
+			}
 		} else if ((w0 & 0xFFFF) == 0x1005) {
 			if (w1 == DEV_ADDR) {
 				dev->ctrl_done = 1;
 				dev->ctrl_status = (w0 >> 16) & 0xF;
 			}
 		} else {
-			usbmuxd_log(LL_DEBUG, "KIS RSM: unhandled record 0x%02x [%x %x %x]", cls, w0, w1, w2);
+			/* the first ones are worth seeing at the default log level */
+			usbmuxd_log(dev->unhandled_logged < 32 ? LL_INFO : LL_DEBUG, "KIS RSM: unhandled record 0x%02x [%x %x %x %x]",
+				cls, w0, w1, w2, get32(p + 12));
+			dev->unhandled_logged++;
 		}
 		return;
 	}
@@ -709,7 +724,10 @@ static void run_data(struct kisrsm_dev *dev)
 	while (dev->tx_head && dev->out_credits > 0) {
 		struct txbuf *tx = dev->tx_head;
 		uint32_t remaining = tx->length - tx->offset;
-		uint32_t chunk = remaining > BULK_CHUNK ? BULK_CHUNK : remaining;
+		uint32_t limit = dev->credit_len[dev->credit_head];
+		if (limit == 0 || limit > BULK_CHUNK)
+			limit = BULK_CHUNK;
+		uint32_t chunk = remaining > limit ? limit : remaining;
 		if (remaining == 0 && !tx->zlp)
 			chunk = 0;
 		if (ring_used(dev) + dev->batch_len + chunk + 8 + RING_MARGIN > RING_SIZE)
@@ -721,6 +739,7 @@ static void run_data(struct kisrsm_dev *dev)
 			emit(dev, out_cls, NULL, 0); /* zero-length packet */
 			tx->zlp = 0;
 		}
+		dev->credit_head = (dev->credit_head + 1) % MAX_CREDITS;
 		dev->out_credits--;
 		dev->last_activity = now_ms();
 		if (tx->offset == tx->length && !tx->zlp) {
