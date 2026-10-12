@@ -37,6 +37,7 @@
 #include "log.h"
 #include "device.h"
 #include "utils.h"
+#include "kisrsm.h"
 
 #if (defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000102)) || (defined(LIBUSBX_API_VERSION) && (LIBUSBX_API_VERSION >= 0x01000102))
 #define HAVE_LIBUSB_HOTPLUG_API 1
@@ -63,7 +64,21 @@ struct usb_device {
 	int wMaxPacketSize;
 	uint64_t speed;
 	struct libusb_device_descriptor devdesc;
+	struct kisrsm_dev *rsm; /* restore mode over a KIS RSM channel (MacBook Neo) */
 };
+
+/* KIS devices (05ac:1881) that may offer a restore channel. The restore OS of a MacBook Neo does not
+ * appear as a USB device: it is tunnelled through the KIS device (see kisrsm.c). */
+struct kis_candidate {
+	libusb_device *dev;
+	uint8_t bus, address;
+	int seen;
+	struct timeval next_probe;
+	struct kisrsm_dev *engine;
+	struct usb_device *usbdev;
+};
+#define KIS_PROBE_INTERVAL 1000
+static struct collection kis_list;
 
 struct mode_context {
 	struct libusb_device* dev;
@@ -81,9 +96,35 @@ static int devlist_failures;
 static int device_polling;
 static int device_hotplug = 1;
 
+static void kis_schedule_probe(struct kis_candidate *c, int ms)
+{
+	get_tick_count(&c->next_probe);
+	c->next_probe.tv_usec += ms * 1000;
+	c->next_probe.tv_sec += c->next_probe.tv_usec / 1000000;
+	c->next_probe.tv_usec %= 1000000;
+}
+
 static void usb_disconnect(struct usb_device *dev)
 {
 	if(!dev->handle) {
+		return;
+	}
+
+	if(dev->rsm) {
+		FOREACH(struct kis_candidate *c, &kis_list) {
+			if(c->usbdev == dev) {
+				c->usbdev = NULL;
+				c->engine = NULL;
+				kis_schedule_probe(c, 2000);
+			}
+		} ENDFOREACH
+		kisrsm_free(dev->rsm);
+		dev->rsm = NULL;
+		dev->handle = NULL;
+		collection_free(&dev->tx_xfers);
+		collection_free(&dev->rx_xfers);
+		collection_remove(&device_list, dev);
+		free(dev);
 		return;
 	}
 
@@ -128,6 +169,26 @@ static void reap_dead_devices(void) {
 			usb_disconnect(usbdev);
 		}
 	} ENDFOREACH
+}
+
+/* Ends the watch of a KIS device that left USB (with its tunnelled restore device, if any). */
+static void kis_remove(struct kis_candidate *c)
+{
+	if(c->usbdev) {
+		struct usb_device *usbdev = c->usbdev;
+		device_remove(usbdev);
+		usb_disconnect(usbdev);
+	} else if(c->engine) {
+		kisrsm_free(c->engine);
+	}
+	libusb_unref_device(c->dev);
+	collection_remove(&kis_list, c);
+	free(c);
+}
+
+static void kis_rx(void *user_data, unsigned char *data, int length)
+{
+	device_data_input((struct usb_device *)user_data, data, (uint32_t)length);
 }
 
 // Callback from write operation
@@ -176,6 +237,9 @@ static void tx_callback(struct libusb_transfer *xfer)
 int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 {
 	int res;
+	if(dev->rsm) {
+		return kisrsm_send(dev->rsm, (unsigned char*)buf, length);
+	}
 	struct libusb_transfer *xfer = libusb_alloc_transfer(0);
 	libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_out, (void*)buf, length, tx_callback, dev, 0);
 	if((res = libusb_submit_transfer(xfer)) < 0) {
@@ -744,6 +808,12 @@ static int usb_device_add(libusb_device* dev)
 	struct usb_device *usbdev = find_device(bus, address);
 	if(usbdev) {
 		usbdev->alive = 1;
+		if(usbdev->rsm) {
+			FOREACH(struct kis_candidate *c, &kis_list) {
+				if(c->bus == bus && c->address == address)
+					c->seen = 1;
+			} ENDFOREACH
+		}
 		return 0; //device already found
 	}
 
@@ -753,6 +823,26 @@ static int usb_device_add(libusb_device* dev)
 	}
 	if(devdesc.idVendor != VID_APPLE)
 		return -1;
+	if(devdesc.idProduct == KIS_PRODUCT_ID) {
+		/* Not a usbmux device itself; watched for a restore channel (kis_process). */
+		FOREACH(struct kis_candidate *c, &kis_list) {
+			if(c->bus == bus && c->address == address) {
+				c->seen = 1;
+				return -1;
+			}
+		} ENDFOREACH
+		struct kis_candidate *c = calloc(1, sizeof(struct kis_candidate));
+		if(c) {
+			c->dev = libusb_ref_device(dev);
+			c->bus = bus;
+			c->address = address;
+			c->seen = 1;
+			get_tick_count(&c->next_probe);
+			collection_add(&kis_list, c);
+			usbmuxd_log(LL_INFO, "Watching KIS device %d-%d for a restore channel", bus, address);
+		}
+		return -1;
+	}
 	if((devdesc.idProduct != PID_APPLE_T2_COPROCESSOR) &&
 	   ((devdesc.idProduct < PID_APPLE_SILICON_RESTORE_LOW) ||
 		(devdesc.idProduct > PID_APPLE_SILICON_RESTORE_MAX)) &&
@@ -841,6 +931,9 @@ int usb_discover(void)
 	FOREACH(struct usb_device *usbdev, &device_list) {
 		usbdev->alive = 0;
 	} ENDFOREACH
+	FOREACH(struct kis_candidate *c, &kis_list) {
+		c->seen = 0;
+	} ENDFOREACH
 
 	// Enumerate all USB devices and mark the ones we already know
 	// about as live, again
@@ -854,6 +947,10 @@ int usb_discover(void)
 
 	// Clean out any device we didn't mark back as live
 	reap_dead_devices();
+	FOREACH(struct kis_candidate *c, &kis_list) {
+		if(!c->seen)
+			kis_remove(c);
+	} ENDFOREACH
 
 	libusb_free_device_list(devs, 1);
 
@@ -921,6 +1018,72 @@ void usb_autodiscover(int enable)
 	device_hotplug = enable;
 }
 
+/* Probes KIS devices for a restore channel and drives the channels that have one. */
+static void kis_process(void)
+{
+	struct timeval now;
+	FOREACH(struct kis_candidate *c, &kis_list) {
+		if(!c->engine) {
+			get_tick_count(&now);
+			if(now.tv_sec < c->next_probe.tv_sec || (now.tv_sec == c->next_probe.tv_sec && now.tv_usec < c->next_probe.tv_usec))
+				continue;
+			kis_schedule_probe(c, KIS_PROBE_INTERVAL);
+			c->engine = kisrsm_probe(c->dev);
+			if(!c->engine)
+				continue;
+		}
+		enum kisrsm_state st = kisrsm_pump(c->engine);
+		if(st == KISRSM_READY) {
+			struct usb_device *usbdev = calloc(1, sizeof(struct usb_device));
+			if(!usbdev) {
+				kisrsm_free(c->engine);
+				c->engine = NULL;
+				continue;
+			}
+			usbdev->handle = kisrsm_handle(c->engine);
+			usbdev->bus = c->bus;
+			usbdev->address = c->address;
+			snprintf(usbdev->serial, sizeof(usbdev->serial), "%s", kisrsm_serial(c->engine));
+			usbdev->alive = 1;
+			usbdev->devdesc = *kisrsm_device_descriptor(c->engine);
+			usbdev->wMaxPacketSize = kisrsm_max_packet_size(c->engine);
+			usbdev->speed = 480000000;
+			usbdev->rsm = c->engine;
+			collection_init(&usbdev->tx_xfers);
+			collection_init(&usbdev->rx_xfers);
+			collection_add(&device_list, usbdev);
+			c->usbdev = usbdev;
+			kisrsm_set_rx_callback(c->engine, kis_rx, usbdev);
+			usbmuxd_log(LL_NOTICE, "Restore device %s tunnelled through KIS device %d-%d", usbdev->serial, c->bus, c->address);
+			if(device_add(usbdev) < 0) {
+				usb_disconnect(usbdev);
+			}
+		} else if(st == KISRSM_CLOSED) {
+			if(c->usbdev) {
+				struct usb_device *usbdev = c->usbdev;
+				device_remove(usbdev);
+				usb_disconnect(usbdev);
+			} else {
+				kisrsm_free(c->engine);
+				c->engine = NULL;
+				kis_schedule_probe(c, 2000);
+			}
+		}
+	} ENDFOREACH
+}
+
+static int kis_poll_remain_ms(int limit)
+{
+	FOREACH(struct kis_candidate *c, &kis_list) {
+		if(c->engine) {
+			int ms = kisrsm_poll_interval(c->engine);
+			if(ms < limit)
+				limit = ms;
+		}
+	} ENDFOREACH
+	return limit;
+}
+
 static int dev_poll_remain_ms(void)
 {
 	int msecs;
@@ -941,7 +1104,9 @@ int usb_get_timeout(void)
 	int msec;
 	int res;
 	int pollrem;
-	pollrem = dev_poll_remain_ms();
+	pollrem = kis_poll_remain_ms(dev_poll_remain_ms());
+	if(collection_count(&kis_list) > 0 && pollrem > KIS_PROBE_INTERVAL)
+		pollrem = KIS_PROBE_INTERVAL;
 	res = libusb_get_next_timeout(NULL, &tv);
 	if(res == 0)
 		return pollrem;
@@ -969,6 +1134,8 @@ int usb_process(void)
 
 	// reap devices marked dead due to an RX error
 	reap_dead_devices();
+
+	kis_process();
 
 	if(dev_poll_remain_ms() <= 0) {
 		res = usb_discover();
@@ -1020,6 +1187,12 @@ static int usb_hotplug_cb(libusb_context *ctx, libusb_device *device, libusb_hot
 	} else if (LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT == event) {
 		uint8_t bus = libusb_get_bus_number(device);
 		uint8_t address = libusb_get_device_address(device);
+		FOREACH(struct kis_candidate *c, &kis_list) {
+			if(c->bus == bus && c->address == address) {
+				kis_remove(c);
+				return 0;
+			}
+		} ENDFOREACH
 		FOREACH(struct usb_device *usbdev, &device_list) {
 			if(usbdev->bus == bus && usbdev->address == address) {
 				usbdev->alive = 0;
@@ -1056,6 +1229,7 @@ int usb_init(void)
 #endif
 
 	collection_init(&device_list);
+	collection_init(&kis_list);
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
 	if (libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
@@ -1088,6 +1262,10 @@ void usb_shutdown(void)
 	libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
 #endif
 
+	FOREACH(struct kis_candidate *c, &kis_list) {
+		kis_remove(c);
+	} ENDFOREACH
+	collection_free(&kis_list);
 	FOREACH(struct usb_device *usbdev, &device_list) {
 		device_remove(usbdev);
 		usb_disconnect(usbdev);
