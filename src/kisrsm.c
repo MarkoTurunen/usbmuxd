@@ -66,6 +66,8 @@
 #define PORT             1
 #define BULK_CHUNK       0x8000 /* largest OUT entry, also when a credit allows more */
 #define MAX_CREDITS      64
+#define STALL_MS         2000 /* no OUT credit for this long while data waits = stalled */
+#define TRACE_EVENTS     64
 #define IN_READS         4
 #define IN_READ_SIZE     0x8000
 #define STEP_TIMEOUT_MS  5000
@@ -131,6 +133,16 @@ struct kisrsm_dev {
 	int credit_head, out_credits;
 	uint32_t last_credit_len;
 	int unhandled_logged;
+	/* Whether a zero-length packet uses up a credit. Assumed until the device stalls right
+	 * after one; then it evidently does not return a credit for it. */
+	int zlp_takes_credit;
+	int zlps_since_credit;
+	uint64_t last_credit_ms;
+	int stall_reported;
+	uint64_t n_out, n_zlp, n_credit, n_in;
+	/* recent OUT entries ('O' length, 'Z') and credits ('C' length), dumped on a stall */
+	struct { char what; uint32_t len; int credits; uint64_t ms; } trace[TRACE_EVENTS];
+	unsigned trace_next;
 	int in_queued;
 	struct txbuf *tx_head, *tx_tail;
 	kisrsm_rx_cb rx_cb;
@@ -149,6 +161,15 @@ static uint64_t now_ms(void)
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void trace_event(struct kisrsm_dev *dev, char what, uint32_t len)
+{
+	unsigned i = dev->trace_next++ % TRACE_EVENTS;
+	dev->trace[i].what = what;
+	dev->trace[i].len = len;
+	dev->trace[i].credits = dev->out_credits;
+	dev->trace[i].ms = now_ms();
 }
 
 static void put32(unsigned char *p, uint32_t v)
@@ -370,6 +391,10 @@ static void handle_record(struct kisrsm_dev *dev, uint8_t cls, const unsigned ch
 					dev->credit_len[(dev->credit_head + dev->out_credits) % MAX_CREDITS] = w2;
 					dev->out_credits++;
 				}
+				dev->n_credit++;
+				dev->zlps_since_credit = 0;
+				dev->last_credit_ms = now_ms();
+				trace_event(dev, 'C', w2);
 			}
 		} else if ((w0 & 0xFFFF) == 0x1005) {
 			if (w1 == DEV_ADDR) {
@@ -394,6 +419,7 @@ static void handle_record(struct kisrsm_dev *dev, uint8_t cls, const unsigned ch
 			if (dev->in_queued > 0)
 				dev->in_queued--;
 			dev->last_activity = now_ms();
+			dev->n_in++;
 			if (dev->rx_cb && length)
 				dev->rx_cb(dev->rx_user, (unsigned char *)p, (int)length);
 		}
@@ -713,6 +739,55 @@ static void run_steps(struct kisrsm_dev *dev)
 
 /* ---------------------------------------------------------------- data phase */
 
+static void report_stall(struct kisrsm_dev *dev, uint64_t now)
+{
+	usbmuxd_log(LL_NOTICE, "KIS RSM: OUT stalled %llu ms: credits %d, entries %llu, zero-length %llu, credits received %llu, "
+		"IN records %llu, H2D used %u, zero-length uses credit %d", (unsigned long long)(now - dev->last_credit_ms),
+		dev->out_credits, (unsigned long long)dev->n_out, (unsigned long long)dev->n_zlp, (unsigned long long)dev->n_credit,
+		(unsigned long long)dev->n_in, ring_used(dev), dev->zlp_takes_credit);
+	unsigned n = dev->trace_next < TRACE_EVENTS ? dev->trace_next : TRACE_EVENTS;
+	char line[512];
+	size_t pos = 0;
+	unsigned i;
+	for (i = 0; i < n; i++) {
+		unsigned k = (dev->trace_next - n + i) % TRACE_EVENTS;
+		pos += (size_t)snprintf(line + pos, sizeof(line) - pos, " %c%u/%d@-%llu", dev->trace[k].what, dev->trace[k].len,
+			dev->trace[k].credits, (unsigned long long)(now - dev->trace[k].ms));
+		if (pos > sizeof(line) - 40 || i == n - 1) {
+			usbmuxd_log(LL_NOTICE, "KIS RSM: recent OUT/credit events (kind length/credits@-ms):%s", line);
+			pos = 0;
+		}
+	}
+}
+
+/* A device that returns no credit for a zero-length packet stalls the OUT direction for good once
+ * its credits are used up. When data waits, no credit came for STALL_MS and zero-length packets were
+ * sent since the last one, stop charging them a credit and give back the ones they took. */
+static void check_stall(struct kisrsm_dev *dev)
+{
+	uint64_t now = now_ms();
+	if (!dev->tx_head || dev->out_credits > 0 || now - dev->last_credit_ms < STALL_MS)
+		return;
+	if (!dev->stall_reported) {
+		dev->stall_reported = 1;
+		report_stall(dev, now);
+	}
+	if (dev->zlp_takes_credit && dev->zlps_since_credit > 0) {
+		usbmuxd_log(LL_NOTICE, "KIS RSM: no credit after %d zero-length packet(s); zero-length packets no longer use a credit",
+			dev->zlps_since_credit);
+		dev->zlp_takes_credit = 0;
+		/* the lengths of the given-back credits are unknown; the last one seen is the best guess */
+		while (dev->zlps_since_credit > 0 && dev->out_credits < MAX_CREDITS) {
+			dev->credit_head = (dev->credit_head + MAX_CREDITS - 1) % MAX_CREDITS;
+			dev->credit_len[dev->credit_head] = dev->last_credit_len;
+			dev->out_credits++;
+			dev->zlps_since_credit--;
+		}
+		dev->zlps_since_credit = 0;
+		dev->stall_reported = 0;
+	}
+}
+
 static void run_data(struct kisrsm_dev *dev)
 {
 	uint16_t ep_in_id = ((uint16_t)dev->ep_in << 8) | DEV_ADDR;
@@ -721,9 +796,12 @@ static void run_data(struct kisrsm_dev *dev)
 		emit_words(dev, CLS_XFER, 0x1000, ep_in_id, IN_READ_SIZE, 0);
 		dev->in_queued++;
 	}
-	while (dev->tx_head && dev->out_credits > 0) {
+	while (dev->tx_head) {
 		struct txbuf *tx = dev->tx_head;
 		uint32_t remaining = tx->length - tx->offset;
+		int is_zlp = (remaining == 0 && tx->zlp);
+		if (dev->out_credits <= 0 && !(is_zlp && !dev->zlp_takes_credit))
+			break;
 		uint32_t limit = dev->credit_len[dev->credit_head];
 		if (limit == 0 || limit > BULK_CHUNK)
 			limit = BULK_CHUNK;
@@ -735,12 +813,19 @@ static void run_data(struct kisrsm_dev *dev)
 		if (remaining > 0) {
 			emit(dev, out_cls, tx->data + tx->offset, chunk);
 			tx->offset += chunk;
+			dev->n_out++;
 		} else {
 			emit(dev, out_cls, NULL, 0); /* zero-length packet */
 			tx->zlp = 0;
+			dev->n_zlp++;
+			dev->zlps_since_credit++;
 		}
-		dev->credit_head = (dev->credit_head + 1) % MAX_CREDITS;
-		dev->out_credits--;
+		if (!is_zlp || dev->zlp_takes_credit) {
+			dev->credit_head = (dev->credit_head + 1) % MAX_CREDITS;
+			dev->out_credits--;
+		}
+		trace_event(dev, is_zlp ? 'Z' : 'O', chunk);
+		dev->stall_reported = 0;
 		dev->last_activity = now_ms();
 		if (tx->offset == tx->length && !tx->zlp) {
 			dev->tx_head = tx->next;
@@ -750,6 +835,7 @@ static void run_data(struct kisrsm_dev *dev)
 			free(tx);
 		}
 	}
+	check_stall(dev);
 }
 
 /* ---------------------------------------------------------------- API */
@@ -802,6 +888,8 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 	dev->drp = (bells[DB_DEVICE_WP + ch] >> 24) * 0x1000;
 	next_step(dev, ST_CMD_START);
 	dev->last_activity = now_ms();
+	dev->last_credit_ms = now_ms();
+	dev->zlp_takes_credit = 1;
 	usbmuxd_log(LL_NOTICE, "KIS RSM: restore channel %d on device %d-%d (H2D 0x%llx, D2H 0x%llx)", ch,
 		libusb_get_bus_number(device), libusb_get_device_address(device),
 		(unsigned long long)dev->h2d, (unsigned long long)dev->d2h);
