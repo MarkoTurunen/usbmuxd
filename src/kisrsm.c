@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "kisrsm.h"
 #include "log.h"
@@ -47,6 +48,10 @@
 #define KIS_INDEX_MEMORY        0x0D
 #define KIS_INDEX_DOORBELLS     0x100
 #define KIS_INDEX_PORTAL_ENABLE 0x16
+#define KIS_INDEX_RSM_TIMEOUT   0x0a    /* portal 0x10 register macOS sets to 0x46500 at KIS init */
+#define KIS_RSM_TIMEOUT_MACOS   0x46500
+#define KIS_EP_PUSH             0x84    /* IN-only endpoint, presumably the doorbell pushes */
+#define KIS_STATUS_RETRIES      5
 #define KIS_PORTAL_ENABLE_RSM   0x30000 /* as macOS: portals 0x10 and 0x11 */
 #define KIS_TIMEOUT             2000
 
@@ -138,6 +143,9 @@ struct kisrsm_dev {
 	int unhandled_logged;
 	uint64_t last_credit_ms;
 	char close_reason[160]; /* why the channel ended, for the log */
+	uint64_t next_stats_ms, next_peek_ms;
+	unsigned long push_bytes;
+	int push_ep_failed;
 	int close_error;        /* ended by a failed request rather than by the device */
 	uint64_t starved_since; /* data waiting with no credit and no open buffer since (0: not waiting) */
 	int stall_reported;
@@ -192,6 +200,9 @@ static uint32_t get32(const unsigned char *p)
  * reply read after taking over a device can be a leftover from another program). */
 static uint16_t kis_seq;
 static int kis_seq_echo;
+/* request statistics for the periodic log line */
+static unsigned long kis_stat_requests;
+static uint64_t kis_stat_slowest_ms;
 
 #define KIS_ATTEMPTS     3
 #define KIS_REPLY_WAITS  3  /* a reply may come late while the device is busy: wait this many KIS_TIMEOUTs */
@@ -231,6 +242,7 @@ static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16
 	if (++kis_seq == 0)
 		kis_seq = 1;
 	seq = kis_seq;
+	uint64_t started = now_ms();
 	req[0] = seq & 0xFF; req[1] = seq >> 8; req[2] = 0xA0; req[3] = portal; req[4] = (uint8_t)argc;
 	req[5] = index & 0xFF;
 	req[6] = ((index >> 8) & 0x3) | ((rpl_words << 2) & 0xFC);
@@ -279,6 +291,9 @@ static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16
 		if (reply_index)
 			*reply_index = rpl[5];
 	}
+	kis_stat_requests++;
+	if (now_ms() - started > kis_stat_slowest_ms)
+		kis_stat_slowest_ms = now_ms() - started;
 	free(req);
 	free(rpl);
 	return res;
@@ -324,11 +339,22 @@ static int mem_write(libusb_device_handle *handle, uint64_t address, const unsig
 {
 	uint32_t args[3] = { (uint32_t)address, (uint32_t)(address >> 32), size };
 	unsigned char reply[8];
-	uint32_t reply_size = sizeof(reply);
-	int res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 3, data, size, 0, 8, reply, &reply_size, NULL);
-	if (res == 0 && (reply_size < 8 || get32(reply + 4) != 0)) {
-		usbmuxd_log(LL_ERROR, "KIS RSM: memory write to 0x%llx failed, status 0x%x", (unsigned long long)address, reply_size < 8 ? 0 : get32(reply + 4));
-		res = LIBUSB_ERROR_IO;
+	uint32_t reply_size;
+	int res, attempt;
+	/* a busy device can refuse a request with a non-zero status; ask again a little later */
+	for (attempt = 1; ; attempt++) {
+		reply_size = sizeof(reply);
+		res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 3, data, size, 0, 8, reply, &reply_size, NULL);
+		if (res != 0 || (reply_size >= 8 && get32(reply + 4) == 0))
+			break;
+		usbmuxd_log(attempt < KIS_STATUS_RETRIES ? LL_WARNING : LL_ERROR,
+			"KIS RSM: memory write of %u bytes to 0x%llx: %u-byte reply, status 0x%x (attempt %d of %d)", size,
+			(unsigned long long)address, reply_size, reply_size >= 8 ? get32(reply + 4) : 0, attempt, KIS_STATUS_RETRIES);
+		if (attempt == KIS_STATUS_RETRIES) {
+			res = LIBUSB_ERROR_IO;
+			break;
+		}
+		usleep(20000 * attempt);
 	}
 	return res;
 }
@@ -343,11 +369,20 @@ static int mem_read(libusb_device_handle *handle, uint64_t address, uint32_t siz
 	if (!reply)
 		return LIBUSB_ERROR_NO_MEM;
 	put32(payload, size);
-	res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 2, payload, 4, 0, size + 8, reply, &reply_size, NULL);
-	if (res == 0 && (reply_size < size + 8 || get32(reply + size + 4) != 0)) {
-		usbmuxd_log(LL_ERROR, "KIS RSM: memory read of %u bytes at 0x%llx failed: %u-byte reply, status 0x%x", size,
-			(unsigned long long)address, reply_size, reply_size >= size + 8 ? get32(reply + size + 4) : 0);
-		res = LIBUSB_ERROR_IO;
+	int attempt;
+	for (attempt = 1; ; attempt++) {
+		reply_size = size + 8;
+		res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 2, payload, 4, 0, size + 8, reply, &reply_size, NULL);
+		if (res != 0 || (reply_size >= size + 8 && get32(reply + size + 4) == 0))
+			break;
+		usbmuxd_log(attempt < KIS_STATUS_RETRIES ? LL_WARNING : LL_ERROR,
+			"KIS RSM: memory read of %u bytes at 0x%llx: %u-byte reply, status 0x%x (attempt %d of %d)", size,
+			(unsigned long long)address, reply_size, reply_size >= size + 8 ? get32(reply + size + 4) : 0, attempt, KIS_STATUS_RETRIES);
+		if (attempt == KIS_STATUS_RETRIES) {
+			res = LIBUSB_ERROR_IO;
+			break;
+		}
+		usleep(20000 * attempt);
 	}
 	if (res == 0)
 		memcpy(out, reply, size);
@@ -368,6 +403,43 @@ static int config_write(libusb_device_handle *handle, uint16_t index, uint32_t v
 	uint32_t reply_size = sizeof(reply);
 	return kis_request(handle, KIS_PORTAL_CONFIG, index, &value, 1, NULL, 0, 1, 0, reply, &reply_size, NULL);
 }
+
+/* Reads a one-word register of a portal (argc 0, one reply word) into *value. */
+static int portal_read(libusb_device_handle *handle, uint8_t portal, uint16_t index, uint32_t *value)
+{
+	unsigned char reply[16];
+	uint32_t reply_size = sizeof(reply);
+	int res = kis_request(handle, portal, index, NULL, 0, NULL, 0, 1, 0, reply, &reply_size, NULL);
+	if (res == 0 && reply_size < 4)
+		res = LIBUSB_ERROR_IO;
+	if (res == 0)
+		*value = get32(reply);
+	return res;
+}
+
+/* macOS writes 0x46500 to register 0x0a of the RSM portal when it opens the KIS device; the value
+ * looks like a timeout. Log what the device has and set the macOS value. */
+static void rsm_portal_setup(libusb_device_handle *handle)
+{
+	uint32_t value = 0, set = KIS_RSM_TIMEOUT_MACOS;
+	unsigned char reply[8];
+	uint32_t reply_size = sizeof(reply);
+	int res = portal_read(handle, KIS_PORTAL_RSM, KIS_INDEX_RSM_TIMEOUT, &value);
+	if (res != 0) {
+		usbmuxd_log(LL_INFO, "KIS RSM: reading portal 0x10 register 0x0a failed (%s)", libusb_error_name(res));
+		return;
+	}
+	if (value == set) {
+		usbmuxd_log(LL_INFO, "KIS RSM: portal 0x10 register 0x0a = 0x%x", value);
+		return;
+	}
+	res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_RSM_TIMEOUT, &set, 1, NULL, 0, 1, 0, reply, &reply_size, NULL);
+	usbmuxd_log(LL_INFO, "KIS RSM: portal 0x10 register 0x0a = 0x%x, set to 0x%x (%s)", value, set,
+		res == 0 ? "ok" : libusb_error_name(res));
+}
+
+/* Diagnostics: reads what is waiting on the IN-only endpoint (pushes nobody else reads). */
+static void peek_push_endpoint(struct kisrsm_dev *dev);
 
 static int find_channel(const uint32_t *bells, int type)
 {
@@ -973,6 +1045,7 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 		libusb_close(handle);
 		return NULL;
 	}
+	rsm_portal_setup(handle);
 	struct kisrsm_dev *dev = calloc(1, sizeof(struct kisrsm_dev));
 	dev->d2h_buf = malloc(D2H_READ_CHUNK);
 	if (!dev || !dev->d2h_buf) {
@@ -999,10 +1072,47 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 	return dev;
 }
 
+static void peek_push_endpoint(struct kisrsm_dev *dev)
+{
+	unsigned char buf[4096];
+	int i, got, res;
+	if (dev->push_ep_failed)
+		return;
+	for (i = 0; i < 16; i++) {
+		got = 0;
+		res = libusb_bulk_transfer(dev->handle, KIS_EP_PUSH, buf, sizeof(buf), &got, 1);
+		if (res == LIBUSB_ERROR_TIMEOUT && got == 0)
+			break;
+		if (res != 0 && res != LIBUSB_ERROR_TIMEOUT) {
+			usbmuxd_log(LL_INFO, "KIS RSM: endpoint 0x%02x not readable (%s)", KIS_EP_PUSH, libusb_error_name(res));
+			dev->push_ep_failed = 1;
+			break;
+		}
+		if (dev->push_bytes == 0 && got >= 12 && buf[2] == 0xA0)
+			usbmuxd_log(LL_INFO, "KIS RSM: endpoint 0x%02x carries portal 0x%x index 0x%x messages (%d bytes)", KIS_EP_PUSH,
+				buf[3], buf[5] | ((buf[6] & 3) << 8), got);
+		dev->push_bytes += (unsigned long)got;
+	}
+}
+
 enum kisrsm_state kisrsm_pump(struct kisrsm_dev *dev)
 {
 	if (dev->step == ST_FAILED)
 		return KISRSM_CLOSED;
+	uint64_t now = now_ms();
+	if (dev->step == ST_RUNNING && now >= dev->next_stats_ms) {
+		if (dev->next_stats_ms)
+			usbmuxd_log(LL_INFO, "KIS RSM: last 30 s: %lu KIS requests (%lu/s), slowest reply %llu ms, %lu bytes on endpoint 0x%02x",
+				kis_stat_requests, kis_stat_requests / 30, (unsigned long long)kis_stat_slowest_ms, dev->push_bytes, KIS_EP_PUSH);
+		kis_stat_requests = 0;
+		kis_stat_slowest_ms = 0;
+		dev->push_bytes = 0;
+		dev->next_stats_ms = now + 30000;
+	}
+	if (now >= dev->next_peek_ms) {
+		peek_push_endpoint(dev);
+		dev->next_peek_ms = now + 5000;
+	}
 	int failed = read_records(dev) != 0;
 	if (!failed) {
 		run_steps(dev);
