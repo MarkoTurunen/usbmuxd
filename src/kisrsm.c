@@ -137,6 +137,7 @@ struct kisrsm_dev {
 	uint32_t last_credit_len;
 	int unhandled_logged;
 	uint64_t last_credit_ms;
+	uint64_t starved_since; /* data waiting with no credit and no open buffer since (0: not waiting) */
 	int stall_reported;
 	uint64_t n_out, n_zlp, n_credit, n_in;
 	/* recent OUT entries ('O' length, 'Z') and credits ('C' length), dumped on a stall */
@@ -392,6 +393,7 @@ static void handle_record(struct kisrsm_dev *dev, uint8_t cls, const unsigned ch
 				}
 				dev->n_credit++;
 				dev->last_credit_ms = now_ms();
+				dev->starved_since = 0;
 				trace_event(dev, 'C', w2);
 			}
 		} else if ((w0 & 0xFFFF) == 0x1005) {
@@ -740,7 +742,7 @@ static void run_steps(struct kisrsm_dev *dev)
 static void report_stall(struct kisrsm_dev *dev, uint64_t now)
 {
 	usbmuxd_log(LL_NOTICE, "KIS RSM: OUT stalled %llu ms: credits %d, open buffer %u/%u, entries %llu, zero-length %llu, "
-		"credits received %llu, IN records %llu, H2D used %u", (unsigned long long)(now - dev->last_credit_ms),
+		"credits received %llu, IN records %llu, H2D used %u", (unsigned long long)(now - dev->starved_since),
 		dev->out_credits, dev->buf_fill, dev->buf_len, (unsigned long long)dev->n_out, (unsigned long long)dev->n_zlp,
 		(unsigned long long)dev->n_credit, (unsigned long long)dev->n_in, ring_used(dev));
 	unsigned n = dev->trace_next < TRACE_EVENTS ? dev->trace_next : TRACE_EVENTS;
@@ -758,11 +760,17 @@ static void report_stall(struct kisrsm_dev *dev, uint64_t now)
 	}
 }
 
-/* Logs (once per stall) when data waits for a credit and none came for STALL_MS. */
+/* Logs (once per stall) when data has waited STALL_MS for a credit. */
 static void check_stall(struct kisrsm_dev *dev)
 {
 	uint64_t now = now_ms();
-	if (!dev->tx_head || dev->out_credits > 0 || dev->buf_len || now - dev->last_credit_ms < STALL_MS)
+	if (!dev->tx_head || dev->out_credits > 0 || dev->buf_len) {
+		dev->starved_since = 0;
+		return;
+	}
+	if (!dev->starved_since)
+		dev->starved_since = now;
+	if (now - dev->starved_since < STALL_MS)
 		return;
 	if (!dev->stall_reported) {
 		dev->stall_reported = 1;
