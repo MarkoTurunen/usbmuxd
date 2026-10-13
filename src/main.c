@@ -52,6 +52,7 @@
 #include "device.h"
 #include "client.h"
 #include "conf.h"
+#include "utils.h"
 
 static const char *socket_path = "/var/run/usbmuxd";
 #define DEFAULT_LOCKFILE "/var/run/usbmuxd.pid"
@@ -318,6 +319,7 @@ static int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout
 static int main_loop(int listenfd)
 {
 	int to, cnt, i, dto;
+	uint64_t last_usb_process = 0;
 	struct fdlist pollfds;
 	struct timespec tspec;
 
@@ -362,6 +364,7 @@ static int main_loop(int listenfd)
 				fdlist_free(&pollfds);
 				return -1;
 			}
+			last_usb_process = mstime64();
 			device_check_timeouts();
 		} else {
 			int done_usb = 0;
@@ -373,6 +376,7 @@ static int main_loop(int listenfd)
 							fdlist_free(&pollfds);
 							return -1;
 						}
+						last_usb_process = mstime64();
 						done_usb = 1;
 					}
 					if(pollfds.owners[i] == FD_LISTEN) {
@@ -386,6 +390,18 @@ static int main_loop(int listenfd)
 						client_process(pollfds.fds[i].fd, pollfds.fds[i].revents);
 					}
 				}
+			}
+			// A client socket that is always ready (e.g. hung up while the
+			// device window is closed) must not starve USB processing: KIS
+			// devices are only pumped from usb_process().
+			if(!done_usb && mstime64() - last_usb_process >= (uint64_t)to) {
+				if(usb_process() < 0) {
+					usbmuxd_log(LL_FATAL, "usb_process() failed");
+					fdlist_free(&pollfds);
+					return -1;
+				}
+				last_usb_process = mstime64();
+				device_check_timeouts();
 			}
 		}
 	}
