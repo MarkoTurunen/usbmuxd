@@ -200,6 +200,11 @@ static uint32_t get32(const unsigned char *p)
  * reply read after taking over a device can be a leftover from another program). */
 static uint16_t kis_seq;
 static int kis_seq_echo;
+/* While probing a device: short timeouts and no retries, so a hung device cannot stall usbmuxd. */
+static int kis_probing;
+#define KIS_PROBE_TIMEOUT 500
+/* What the last probe suggests before the next one (kisrsm_probe_delay_ms). */
+static int kis_probe_delay_ms;
 /* request statistics for the periodic log line */
 static unsigned long kis_stat_requests;
 static uint64_t kis_stat_slowest_ms;
@@ -252,12 +257,13 @@ static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16
 		put32(req + 12 + 4 * i, args[i]);
 	if (payload_size)
 		memcpy(req + 12 + 4 * argc, payload, payload_size);
-	res = libusb_bulk_transfer(handle, ep, req, req_size, &sent, KIS_TIMEOUT);
+	unsigned int timeout = kis_probing ? KIS_PROBE_TIMEOUT : KIS_TIMEOUT;
+	res = libusb_bulk_transfer(handle, ep, req, req_size, &sent, timeout);
 	if (res == 0 && sent != (int)req_size)
 		res = LIBUSB_ERROR_IO;
 	while (res == 0) {
-		res = libusb_bulk_transfer(handle, ep | 0x80, rpl, rpl_cap, &got, KIS_TIMEOUT);
-		if (res == LIBUSB_ERROR_TIMEOUT && ++waits < KIS_REPLY_WAITS) {
+		res = libusb_bulk_transfer(handle, ep | 0x80, rpl, rpl_cap, &got, timeout);
+		if (res == LIBUSB_ERROR_TIMEOUT && ++waits < (kis_probing ? 1 : KIS_REPLY_WAITS)) {
 			/* the request went out; a busy device answers late - wait rather than send it again */
 			if (waits == 1)
 				usbmuxd_log(LL_INFO, "KIS RSM: slow reply to portal 0x%x index 0x%x, waiting", portal, index);
@@ -308,14 +314,15 @@ static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t in
 {
 	uint32_t capacity = *reply_size;
 	int attempt, res = LIBUSB_ERROR_OTHER;
-	for (attempt = 1; attempt <= KIS_ATTEMPTS; attempt++) {
+	int attempts = kis_probing ? 1 : KIS_ATTEMPTS;
+	for (attempt = 1; attempt <= attempts; attempt++) {
 		*reply_size = capacity;
 		res = kis_request_once(handle, portal, index, args, argc, payload, payload_size, rpl_words, min_reply,
 			reply, reply_size, reply_index);
 		if (res == 0 || res == LIBUSB_ERROR_NO_DEVICE || res == LIBUSB_ERROR_NO_MEM)
 			break;
-		usbmuxd_log(LL_WARNING, "KIS RSM: request to portal 0x%x index 0x%x failed (%s), attempt %d of %d",
-			portal, index, libusb_error_name(res), attempt, KIS_ATTEMPTS);
+		usbmuxd_log(kis_probing ? LL_INFO : LL_WARNING, "KIS RSM: request to portal 0x%x index 0x%x failed (%s), attempt %d of %d",
+			portal, index, libusb_error_name(res), attempt, attempts);
 		kis_drain(handle, ((portal == KIS_PORTAL_CONFIG) ? 0x01 : 0x03) | 0x80);
 	}
 	return res;
@@ -1024,7 +1031,7 @@ static void run_data(struct kisrsm_dev *dev)
 
 /* ---------------------------------------------------------------- API */
 
-struct kisrsm_dev *kisrsm_probe(libusb_device *device)
+static struct kisrsm_dev *probe(libusb_device *device)
 {
 	libusb_device_handle *handle = NULL;
 	uint32_t bells[256];
@@ -1035,7 +1042,10 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 		libusb_close(handle);
 		return NULL;
 	}
-	if (read_doorbells(handle, bells, &available) != 0 || !available || (ch = find_channel(bells, CHANNEL_VHCI)) < 0) {
+	int res = read_doorbells(handle, bells, &available);
+	if (res != 0)
+		kis_probe_delay_ms = 30000; /* does not answer: leave it alone for a while */
+	if (res != 0 || !available || (ch = find_channel(bells, CHANNEL_VHCI)) < 0) {
 		libusb_release_interface(handle, 0);
 		libusb_close(handle);
 		return NULL;
@@ -1043,6 +1053,7 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 	if (bells[DB_HOST_WP + ch] != 0) {
 		/* another host (or an earlier engine) already brought this channel up; its port state is
 		 * unknown. Probed every second, so say it once per device. */
+		kis_probe_delay_ms = 10000;
 		static int last_bus = -1, last_address = -1;
 		if (last_bus != libusb_get_bus_number(device) || last_address != libusb_get_device_address(device)) {
 			last_bus = libusb_get_bus_number(device);
@@ -1084,6 +1095,20 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 		libusb_get_bus_number(device), libusb_get_device_address(device),
 		(unsigned long long)dev->h2d, (unsigned long long)dev->d2h);
 	return dev;
+}
+
+struct kisrsm_dev *kisrsm_probe(libusb_device *device)
+{
+	kis_probing = 1;
+	kis_probe_delay_ms = 0;
+	struct kisrsm_dev *dev = probe(device);
+	kis_probing = 0;
+	return dev;
+}
+
+int kisrsm_probe_delay_ms(void)
+{
+	return kis_probe_delay_ms;
 }
 
 static void peek_push_endpoint(struct kisrsm_dev *dev)

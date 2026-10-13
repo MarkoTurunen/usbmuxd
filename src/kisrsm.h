@@ -34,6 +34,10 @@ enum kisrsm_state {
  * Returns NULL (device closed again) if it does not or is in use. */
 struct kisrsm_dev *kisrsm_probe(libusb_device *device);
 
+/* Milliseconds the last kisrsm_probe suggests waiting before probing that device again (0: the usual
+ * interval): longer for a channel in use and for a device that does not answer. */
+int kisrsm_probe_delay_ms(void);
+
 /* Drives the channel; call often (see kisrsm_poll_interval). */
 enum kisrsm_state kisrsm_pump(struct kisrsm_dev *dev);
 

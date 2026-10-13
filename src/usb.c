@@ -1027,8 +1027,8 @@ static void kis_process(void)
 			get_tick_count(&now);
 			if(now.tv_sec < c->next_probe.tv_sec || (now.tv_sec == c->next_probe.tv_sec && now.tv_usec < c->next_probe.tv_usec))
 				continue;
-			kis_schedule_probe(c, KIS_PROBE_INTERVAL);
 			c->engine = kisrsm_probe(c->dev);
+			kis_schedule_probe(c, kisrsm_probe_delay_ms() ? kisrsm_probe_delay_ms() : KIS_PROBE_INTERVAL);
 			if(!c->engine)
 				continue;
 		}
