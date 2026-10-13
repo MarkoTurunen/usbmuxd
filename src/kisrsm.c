@@ -137,6 +137,8 @@ struct kisrsm_dev {
 	uint32_t last_credit_len;
 	int unhandled_logged;
 	uint64_t last_credit_ms;
+	char close_reason[160]; /* why the channel ended, for the log */
+	int close_error;        /* ended by a failed request rather than by the device */
 	uint64_t starved_since; /* data waiting with no credit and no open buffer since (0: not waiting) */
 	int stall_reported;
 	uint64_t n_out, n_zlp, n_credit, n_in;
@@ -185,7 +187,30 @@ static uint32_t get32(const unsigned char *p)
 /* ---------------------------------------------------------------- KIS requests */
 
 /* One KIS request; reply receives the payload after the 12-byte header. */
-static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t index, const uint32_t *args, int argc,
+/* Requests carry a sequence number that the device echoes in its reply, so a late reply to an
+ * earlier, retried request can be told apart. kis_seq_echo: -1 not known yet, 1 echoed, 0 not. */
+static uint16_t kis_seq;
+static int kis_seq_echo = -1;
+
+#define KIS_ATTEMPTS     3
+#define KIS_MAX_STALE    4
+
+/* Reads and drops replies still queued on an IN endpoint (late replies to a failed request). */
+static void kis_drain(libusb_device_handle *handle, uint8_t ep_in)
+{
+	unsigned char *buf = malloc(0x10000 + 1024);
+	int got, i;
+	if (!buf)
+		return;
+	for (i = 0; i < 16; i++) {
+		got = 0;
+		if (libusb_bulk_transfer(handle, ep_in, buf, 0x10000 + 1024, &got, 50) != 0)
+			break;
+	}
+	free(buf);
+}
+
+static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16_t index, const uint32_t *args, int argc,
 		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words,
 		unsigned char *reply, uint32_t *reply_size, uint8_t *reply_index)
 {
@@ -193,14 +218,18 @@ static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t in
 	unsigned char *req = malloc(req_size);
 	uint32_t rpl_cap = 12 + *reply_size + 64;
 	unsigned char *rpl = malloc(rpl_cap);
-	int res, sent = 0, got = 0, i;
+	int res, sent = 0, got = 0, i, stale = 0;
 	uint8_t ep = (portal == KIS_PORTAL_CONFIG) ? 0x01 : 0x03;
+	uint16_t seq;
 	if (!req || !rpl) {
 		free(req);
 		free(rpl);
 		return LIBUSB_ERROR_NO_MEM;
 	}
-	req[0] = 0; req[1] = 0; req[2] = 0xA0; req[3] = portal; req[4] = (uint8_t)argc;
+	if (++kis_seq == 0)
+		kis_seq = 1;
+	seq = kis_seq;
+	req[0] = seq & 0xFF; req[1] = seq >> 8; req[2] = 0xA0; req[3] = portal; req[4] = (uint8_t)argc;
 	req[5] = index & 0xFF;
 	req[6] = ((index >> 8) & 0x3) | ((rpl_words << 2) & 0xFC);
 	req[7] = (rpl_words >> 6) & 0xFF;
@@ -212,10 +241,22 @@ static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t in
 	res = libusb_bulk_transfer(handle, ep, req, req_size, &sent, KIS_TIMEOUT);
 	if (res == 0 && sent != (int)req_size)
 		res = LIBUSB_ERROR_IO;
-	if (res == 0)
+	while (res == 0) {
 		res = libusb_bulk_transfer(handle, ep | 0x80, rpl, rpl_cap, &got, KIS_TIMEOUT);
-	if (res == 0 && got < 12)
-		res = LIBUSB_ERROR_IO;
+		if (res == 0 && got < 12)
+			res = LIBUSB_ERROR_IO;
+		if (res != 0)
+			break;
+		uint16_t rseq = rpl[0] | (rpl[1] << 8);
+		if (kis_seq_echo < 0)
+			kis_seq_echo = (rseq == seq);
+		if (kis_seq_echo == 0 || rseq == seq)
+			break;
+		/* a late reply to an earlier request: drop it and read on */
+		usbmuxd_log(LL_INFO, "KIS RSM: dropped a late reply (sequence %u, expected %u)", rseq, seq);
+		if (++stale > KIS_MAX_STALE)
+			res = LIBUSB_ERROR_IO;
+	}
 	if (res == 0) {
 		uint32_t n = got - 12;
 		if (n > *reply_size)
@@ -227,6 +268,27 @@ static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t in
 	}
 	free(req);
 	free(rpl);
+	return res;
+}
+
+/* One KIS request with its reply. Every request this engine sends can be repeated safely (memory
+ * reads, writes of the same data to the same address, doorbell reads and writes), so a timeout or
+ * transfer error is retried after dropping any late replies. */
+static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t index, const uint32_t *args, int argc,
+		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words,
+		unsigned char *reply, uint32_t *reply_size, uint8_t *reply_index)
+{
+	uint32_t capacity = *reply_size;
+	int attempt, res = LIBUSB_ERROR_OTHER;
+	for (attempt = 1; attempt <= KIS_ATTEMPTS; attempt++) {
+		*reply_size = capacity;
+		res = kis_request_once(handle, portal, index, args, argc, payload, payload_size, rpl_words, reply, reply_size, reply_index);
+		if (res == 0 || res == LIBUSB_ERROR_NO_DEVICE || res == LIBUSB_ERROR_NO_MEM)
+			break;
+		usbmuxd_log(LL_WARNING, "KIS RSM: request to portal 0x%x index 0x%x failed (%s), attempt %d of %d",
+			portal, index, libusb_error_name(res), attempt, KIS_ATTEMPTS);
+		kis_drain(handle, ((portal == KIS_PORTAL_CONFIG) ? 0x01 : 0x03) | 0x80);
+	}
 	return res;
 }
 
@@ -433,11 +495,16 @@ static void handle_record(struct kisrsm_dev *dev, uint8_t cls, const unsigned ch
 static int read_records(struct kisrsm_dev *dev)
 {
 	uint32_t bells[256];
-	int available = 0;
-	if (read_doorbells(dev->handle, bells, &available) != 0)
+	int available = 0, res;
+	if ((res = read_doorbells(dev->handle, bells, &available)) != 0) {
+		dev->close_error = 1;
+		snprintf(dev->close_reason, sizeof(dev->close_reason), "doorbell read failed (%s)", libusb_error_name(res));
 		return -1;
-	if (!available || bells[0] != RSM_MAGIC || bells[DB_CHAN_DESC + dev->ch] != dev->desc)
+	}
+	if (!available || bells[0] != RSM_MAGIC || bells[DB_CHAN_DESC + dev->ch] != dev->desc) {
+		snprintf(dev->close_reason, sizeof(dev->close_reason), "the device no longer offers the channel");
 		return -1;
+	}
 	uint32_t device = bells[DB_DEVICE_WP + dev->ch];
 	dev->drp = (device >> 24) * 0x1000;
 	uint32_t wp = (device & 0xFFFFF) * 4 % RING_SIZE;
@@ -450,8 +517,11 @@ static int read_records(struct kisrsm_dev *dev)
 			chunk = RING_SIZE - dev->dr;
 		if (chunk < 4)
 			break;
-		if (mem_read(dev->handle, dev->d2h + dev->dr, chunk, dev->d2h_buf) != 0)
+		if ((res = mem_read(dev->handle, dev->d2h + dev->dr, chunk, dev->d2h_buf)) != 0) {
+			dev->close_error = 1;
+			snprintf(dev->close_reason, sizeof(dev->close_reason), "D2H ring read failed (%s)", libusb_error_name(res));
 			return -1;
+		}
 		uint32_t pos = 0;
 		while (pos + 4 <= chunk) {
 			uint32_t hdr = get32(dev->d2h_buf + pos);
@@ -459,14 +529,18 @@ static int read_records(struct kisrsm_dev *dev)
 			uint32_t length = hdr & 0xFFFFFF;
 			uint32_t size = 4 + ((length + 3) & ~3u);
 			if (length > MAX_RECORD) {
-				usbmuxd_log(LL_ERROR, "KIS RSM: invalid record 0x%08x at D2H offset 0x%x", hdr, dev->dr + pos);
+				dev->close_error = 1;
+				snprintf(dev->close_reason, sizeof(dev->close_reason), "invalid record 0x%08x at D2H offset 0x%x", hdr, dev->dr + pos);
 				return -1;
 			}
 			if (pos + size > chunk) {
 				if (pos == 0) {
 					/* record larger than what we read: read it whole */
 					unsigned char *rec = malloc(size);
-					if (!rec || mem_read(dev->handle, dev->d2h + dev->dr, size, rec) != 0) {
+					if (!rec || (res = mem_read(dev->handle, dev->d2h + dev->dr, size, rec)) != 0) {
+						dev->close_error = 1;
+						snprintf(dev->close_reason, sizeof(dev->close_reason), "D2H record read failed (%s)",
+							rec ? libusb_error_name(res) : "out of memory");
 						free(rec);
 						return -1;
 					}
@@ -500,11 +574,10 @@ static int write_entries(struct kisrsm_dev *dev, uint32_t at, uint32_t from, uin
 	uint32_t first_end = to;
 	if ((24 + (to - from)) % 512 == 0 && last > from)
 		first_end = last;
-	if (mem_write(dev->handle, dev->h2d + at, dev->batch + from, first_end - from) != 0)
-		return -1;
-	if (first_end < to && mem_write(dev->handle, dev->h2d + at + (first_end - from), dev->batch + first_end, to - first_end) != 0)
-		return -1;
-	return 0;
+	int res = mem_write(dev->handle, dev->h2d + at, dev->batch + from, first_end - from);
+	if (res == 0 && first_end < to)
+		res = mem_write(dev->handle, dev->h2d + at + (first_end - from), dev->batch + first_end, to - first_end);
+	return res;
 }
 
 /* Writes the collected entries and rings the doorbell. An entry that crosses the ring end is
@@ -524,18 +597,26 @@ static int flush(struct kisrsm_dev *dev)
 			}
 			pos += 4 + (((get32(dev->batch + pos) & 0xFFFFFF) + 3) & ~3u);
 		}
-		if (write_entries(dev, dev->hw, 0, split) != 0)
+		int res = write_entries(dev, dev->hw, 0, split);
+		if (res == 0 && split < dev->batch_len)
+			res = write_entries(dev, dev->hw + split - RING_SIZE, split, dev->batch_len);
+		if (res != 0) {
+			dev->close_error = 1;
+			snprintf(dev->close_reason, sizeof(dev->close_reason), "H2D ring write failed (%s)", libusb_error_name(res));
 			return -1;
-		if (split < dev->batch_len && write_entries(dev, dev->hw + split - RING_SIZE, split, dev->batch_len) != 0)
-			return -1;
+		}
 		dev->hw = (dev->hw + dev->batch_len) % RING_SIZE;
 		dev->batch_len = 0;
 		dev->batch_last = 0;
 	}
 	uint32_t doorbell = (((dev->dr >> 12) & 0xFF) << 24) | ((dev->hw / 4) & 0xFFFFF);
 	if (doorbell != dev->last_doorbell) {
-		if (doorbell_write(dev->handle, DB_HOST_WP + dev->ch, doorbell) != 0)
+		int res = doorbell_write(dev->handle, DB_HOST_WP + dev->ch, doorbell);
+		if (res != 0) {
+			dev->close_error = 1;
+			snprintf(dev->close_reason, sizeof(dev->close_reason), "doorbell write failed (%s)", libusb_error_name(res));
 			return -1;
+		}
 		dev->last_doorbell = doorbell;
 	}
 	return 0;
@@ -857,9 +938,15 @@ struct kisrsm_dev *kisrsm_probe(libusb_device *device)
 		return NULL;
 	}
 	if (bells[DB_HOST_WP + ch] != 0) {
-		/* another host already brought this channel up; its port state is unknown */
-		usbmuxd_log(LL_WARNING, "KIS RSM: restore channel %d of device %d-%d is already in use", ch,
-			libusb_get_bus_number(device), libusb_get_device_address(device));
+		/* another host (or an earlier engine) already brought this channel up; its port state is
+		 * unknown. Probed every second, so say it once per device. */
+		static int last_bus = -1, last_address = -1;
+		if (last_bus != libusb_get_bus_number(device) || last_address != libusb_get_device_address(device)) {
+			last_bus = libusb_get_bus_number(device);
+			last_address = libusb_get_device_address(device);
+			usbmuxd_log(LL_WARNING, "KIS RSM: restore channel %d of device %d-%d is already in use; "
+				"the device has to restart the restore", ch, last_bus, last_address);
+		}
 		libusb_release_interface(handle, 0);
 		libusb_close(handle);
 		return NULL;
@@ -899,15 +986,16 @@ enum kisrsm_state kisrsm_pump(struct kisrsm_dev *dev)
 {
 	if (dev->step == ST_FAILED)
 		return KISRSM_CLOSED;
-	if (read_records(dev) != 0) {
-		usbmuxd_log(LL_NOTICE, "KIS RSM: restore channel %d closed", dev->ch);
-		dev->step = ST_FAILED;
-		return KISRSM_CLOSED;
+	int failed = read_records(dev) != 0;
+	if (!failed) {
+		run_steps(dev);
+		if (dev->step == ST_RUNNING)
+			run_data(dev);
+		failed = flush(dev) != 0;
 	}
-	run_steps(dev);
-	if (dev->step == ST_RUNNING)
-		run_data(dev);
-	if (flush(dev) != 0) {
+	if (failed) {
+		usbmuxd_log(dev->close_error ? LL_ERROR : LL_NOTICE, "KIS RSM: restore channel %d closed: %s", dev->ch,
+			dev->close_reason[0] ? dev->close_reason : "unknown reason");
 		dev->step = ST_FAILED;
 		return KISRSM_CLOSED;
 	}
