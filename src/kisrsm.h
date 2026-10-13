@@ -54,8 +54,6 @@ const struct libusb_device_descriptor *kisrsm_device_descriptor(struct kisrsm_de
 const char *kisrsm_serial(struct kisrsm_dev *dev);
 libusb_device_handle *kisrsm_handle(struct kisrsm_dev *dev);
 int kisrsm_max_packet_size(struct kisrsm_dev *dev);
-/* The longest usbmux packet that takes a single device receive buffer. */
-int kisrsm_max_transfer(struct kisrsm_dev *dev);
 
 /* Releases the KIS device and frees the engine (queued data is dropped). */
 void kisrsm_free(struct kisrsm_dev *dev);

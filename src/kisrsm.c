@@ -1228,17 +1228,6 @@ int kisrsm_max_packet_size(struct kisrsm_dev *dev)
 	return 512;
 }
 
-/* The OUT credit length less 4: a transfer of this size fills at most one device receive buffer and,
- * not being a multiple of 512, ends it. The MacBook Neo grants two 32 KB buffers at a time and turns
- * them over at a fixed rate (about 350 per second, also for macOS); a 49152-byte usbmux packet takes
- * two of them (32 KB, then 16 KB closed by a zero-length packet), so packets of this size carry a
- * third more data per buffer. */
-int kisrsm_max_transfer(struct kisrsm_dev *dev)
-{
-	uint32_t len = dev->last_credit_len >= 1024 ? dev->last_credit_len : BULK_CHUNK;
-	return (int)len - 4;
-}
-
 void kisrsm_free(struct kisrsm_dev *dev)
 {
 	if (!dev)
