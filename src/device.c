@@ -381,7 +381,7 @@ int device_start_connect(int device_id, uint16_t dport, struct mux_client *clien
 	conn->tx_win = 131072;
 	conn->rx_recvd = 0;
 	conn->flags = 0;
-	conn->max_payload = USB_MTU - sizeof(struct mux_header) - sizeof(struct tcphdr);
+	conn->max_payload = usb_get_max_transfer(dev->usbdev) - sizeof(struct mux_header) - sizeof(struct tcphdr);
 
 	conn->ob_buf = malloc(CONN_OUTBUF_SIZE);
 	conn->ob_capacity = CONN_OUTBUF_SIZE;

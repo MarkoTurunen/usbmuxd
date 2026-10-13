@@ -1002,6 +1002,16 @@ uint64_t usb_get_speed(struct usb_device *dev)
 	return dev->speed;
 }
 
+int usb_get_max_transfer(struct usb_device *dev)
+{
+	// a KIS restore device takes one transfer per receive buffer (see kisrsm_max_transfer)
+	if (dev->rsm) {
+		int max = kisrsm_max_transfer(dev->rsm);
+		return max < USB_MTU ? max : USB_MTU;
+	}
+	return USB_MTU;
+}
+
 void usb_get_fds(struct fdlist *list)
 {
 	const struct libusb_pollfd **usbfds;
