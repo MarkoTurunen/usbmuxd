@@ -188,6 +188,14 @@ static void kis_remove(struct kis_candidate *c)
 
 static void kis_rx(void *user_data, unsigned char *data, int length)
 {
+	// device_data_input() takes at most USB_MRU bytes, the size of the reads of other devices;
+	// a longer KIS transfer is handed over in USB_MRU pieces, gathered again like a transfer
+	// split across reads (MacBook Neo: a 27053-byte packet was dropped as "too much data").
+	while(length > USB_MRU) {
+		device_data_input((struct usb_device *)user_data, data, USB_MRU);
+		data += USB_MRU;
+		length -= USB_MRU;
+	}
 	device_data_input((struct usb_device *)user_data, data, (uint32_t)length);
 }
 
