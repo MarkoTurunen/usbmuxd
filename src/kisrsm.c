@@ -335,7 +335,15 @@ static int read_doorbells(libusb_device_handle *handle, uint32_t bells[256], int
 	return 0;
 }
 
-static int mem_write(libusb_device_handle *handle, uint64_t address, const unsigned char *data, uint32_t size)
+/* KIS transfers that are a multiple of the 512-byte packet size end without a short packet, and the
+ * device then takes the next request for part of the same one: it never answers that request and
+ * refuses the following ones (MacBook Neo, test28-31). The macOS host never sends or asks for such a
+ * transfer (none in 26000 requests and 35000 replies of a KIS capture). Requests and replies here
+ * have a 24- or 20-byte overhead; a size that would make them a multiple of 512 is done in two parts. */
+#define KIS_WRITE_OVERHEAD 24 /* header 12 + three argument words */
+#define KIS_READ_OVERHEAD  20 /* reply header 12 + size and status words */
+
+static int mem_write_once(libusb_device_handle *handle, uint64_t address, const unsigned char *data, uint32_t size)
 {
 	uint32_t args[3] = { (uint32_t)address, (uint32_t)(address >> 32), size };
 	unsigned char reply[8];
@@ -359,7 +367,16 @@ static int mem_write(libusb_device_handle *handle, uint64_t address, const unsig
 	return res;
 }
 
-static int mem_read(libusb_device_handle *handle, uint64_t address, uint32_t size, unsigned char *out)
+static int mem_write(libusb_device_handle *handle, uint64_t address, const unsigned char *data, uint32_t size)
+{
+	if ((KIS_WRITE_OVERHEAD + size) % 512 == 0 && size > 4) {
+		int res = mem_write_once(handle, address, data, size - 4);
+		return res != 0 ? res : mem_write_once(handle, address + size - 4, data + size - 4, 4);
+	}
+	return mem_write_once(handle, address, data, size);
+}
+
+static int mem_read_once(libusb_device_handle *handle, uint64_t address, uint32_t size, unsigned char *out)
 {
 	uint32_t args[2] = { (uint32_t)address, (uint32_t)(address >> 32) };
 	unsigned char payload[4];
@@ -388,6 +405,15 @@ static int mem_read(libusb_device_handle *handle, uint64_t address, uint32_t siz
 		memcpy(out, reply, size);
 	free(reply);
 	return res;
+}
+
+static int mem_read(libusb_device_handle *handle, uint64_t address, uint32_t size, unsigned char *out)
+{
+	if ((KIS_READ_OVERHEAD + size) % 512 == 0 && size > 4) {
+		int res = mem_read_once(handle, address, size - 4, out);
+		return res != 0 ? res : mem_read_once(handle, address + size - 4, 4, out + size - 4);
+	}
+	return mem_read_once(handle, address, size, out);
 }
 
 static int doorbell_write(libusb_device_handle *handle, int doorbell, uint32_t value)
@@ -649,24 +675,12 @@ static int read_records(struct kisrsm_dev *dev)
 	return 0;
 }
 
-/* Writes entries batch[from, to) at ring offset at. A KIS request whose length is a multiple of 512
- * would end without a short packet, so the last entry is written separately then. */
+/* Writes entries batch[from, to) at ring offset at (mem_write keeps the request off multiples of 512). */
 static int write_entries(struct kisrsm_dev *dev, uint32_t at, uint32_t from, uint32_t to)
 {
-	uint32_t last = from, pos = from;
 	if (from == to)
 		return 0;
-	while (pos < to) {
-		last = pos;
-		pos += 4 + (((get32(dev->batch + pos) & 0xFFFFFF) + 3) & ~3u);
-	}
-	uint32_t first_end = to;
-	if ((24 + (to - from)) % 512 == 0 && last > from)
-		first_end = last;
-	int res = mem_write(dev->handle, dev->h2d + at, dev->batch + from, first_end - from);
-	if (res == 0 && first_end < to)
-		res = mem_write(dev->handle, dev->h2d + at + (first_end - from), dev->batch + first_end, to - first_end);
-	return res;
+	return mem_write(dev->handle, dev->h2d + at, dev->batch + from, to - from);
 }
 
 /* Writes the collected entries and rings the doorbell. An entry that crosses the ring end is
