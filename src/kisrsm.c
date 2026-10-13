@@ -187,13 +187,15 @@ static uint32_t get32(const unsigned char *p)
 /* ---------------------------------------------------------------- KIS requests */
 
 /* One KIS request; reply receives the payload after the 12-byte header. */
-/* Requests carry a sequence number that the device echoes in its reply, so a late reply to an
- * earlier, retried request can be told apart. kis_seq_echo: -1 not known yet, 1 echoed, 0 not. */
+/* Requests carry a sequence number that the device repeats in its reply, so a late reply to an
+ * earlier request can be told apart. Checked once a reply has been seen to repeat it (the first
+ * reply read after taking over a device can be a leftover from another program). */
 static uint16_t kis_seq;
-static int kis_seq_echo = -1;
+static int kis_seq_echo;
 
 #define KIS_ATTEMPTS     3
-#define KIS_MAX_STALE    4
+#define KIS_REPLY_WAITS  3  /* a reply may come late while the device is busy: wait this many KIS_TIMEOUTs */
+#define KIS_MAX_STALE    8
 
 /* Reads and drops replies still queued on an IN endpoint (late replies to a failed request). */
 static void kis_drain(libusb_device_handle *handle, uint8_t ep_in)
@@ -211,14 +213,14 @@ static void kis_drain(libusb_device_handle *handle, uint8_t ep_in)
 }
 
 static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16_t index, const uint32_t *args, int argc,
-		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words,
+		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words, uint32_t min_reply,
 		unsigned char *reply, uint32_t *reply_size, uint8_t *reply_index)
 {
 	uint32_t req_size = 12 + 4 * argc + payload_size;
 	unsigned char *req = malloc(req_size);
 	uint32_t rpl_cap = 12 + *reply_size + 64;
 	unsigned char *rpl = malloc(rpl_cap);
-	int res, sent = 0, got = 0, i, stale = 0;
+	int res, sent = 0, got = 0, i, stale = 0, waits = 0;
 	uint8_t ep = (portal == KIS_PORTAL_CONFIG) ? 0x01 : 0x03;
 	uint16_t seq;
 	if (!req || !rpl) {
@@ -243,17 +245,28 @@ static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16
 		res = LIBUSB_ERROR_IO;
 	while (res == 0) {
 		res = libusb_bulk_transfer(handle, ep | 0x80, rpl, rpl_cap, &got, KIS_TIMEOUT);
+		if (res == LIBUSB_ERROR_TIMEOUT && ++waits < KIS_REPLY_WAITS) {
+			/* the request went out; a busy device answers late - wait rather than send it again */
+			if (waits == 1)
+				usbmuxd_log(LL_INFO, "KIS RSM: slow reply to portal 0x%x index 0x%x, waiting", portal, index);
+			res = 0;
+			continue;
+		}
 		if (res == 0 && got < 12)
 			res = LIBUSB_ERROR_IO;
 		if (res != 0)
 			break;
 		uint16_t rseq = rpl[0] | (rpl[1] << 8);
-		if (kis_seq_echo < 0)
-			kis_seq_echo = (rseq == seq);
-		if (kis_seq_echo == 0 || rseq == seq)
+		uint32_t rlen = (uint32_t)got - 12;
+		if (rseq == seq && rlen >= min_reply) {
+			kis_seq_echo = 1;
+			break;
+		}
+		if (!kis_seq_echo && rlen >= min_reply)
 			break;
 		/* a late reply to an earlier request: drop it and read on */
-		usbmuxd_log(LL_INFO, "KIS RSM: dropped a late reply (sequence %u, expected %u)", rseq, seq);
+		usbmuxd_log(LL_INFO, "KIS RSM: dropped a late reply (sequence %u, %u bytes; expected %u, %u+ bytes)",
+			rseq, rlen, seq, min_reply);
 		if (++stale > KIS_MAX_STALE)
 			res = LIBUSB_ERROR_IO;
 	}
@@ -275,14 +288,15 @@ static int kis_request_once(libusb_device_handle *handle, uint8_t portal, uint16
  * reads, writes of the same data to the same address, doorbell reads and writes), so a timeout or
  * transfer error is retried after dropping any late replies. */
 static int kis_request(libusb_device_handle *handle, uint8_t portal, uint16_t index, const uint32_t *args, int argc,
-		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words,
+		const unsigned char *payload, uint32_t payload_size, uint16_t rpl_words, uint32_t min_reply,
 		unsigned char *reply, uint32_t *reply_size, uint8_t *reply_index)
 {
 	uint32_t capacity = *reply_size;
 	int attempt, res = LIBUSB_ERROR_OTHER;
 	for (attempt = 1; attempt <= KIS_ATTEMPTS; attempt++) {
 		*reply_size = capacity;
-		res = kis_request_once(handle, portal, index, args, argc, payload, payload_size, rpl_words, reply, reply_size, reply_index);
+		res = kis_request_once(handle, portal, index, args, argc, payload, payload_size, rpl_words, min_reply,
+			reply, reply_size, reply_index);
 		if (res == 0 || res == LIBUSB_ERROR_NO_DEVICE || res == LIBUSB_ERROR_NO_MEM)
 			break;
 		usbmuxd_log(LL_WARNING, "KIS RSM: request to portal 0x%x index 0x%x failed (%s), attempt %d of %d",
@@ -297,7 +311,7 @@ static int read_doorbells(libusb_device_handle *handle, uint32_t bells[256], int
 	unsigned char reply[1024 + 8];
 	uint32_t size = sizeof(reply);
 	uint8_t index = 0;
-	int i, res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_DOORBELLS, NULL, 0, NULL, 0, 256, reply, &size, &index);
+	int i, res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_DOORBELLS, NULL, 0, NULL, 0, 256, 0, reply, &size, &index);
 	if (res != 0)
 		return res;
 	*available = (index == 0 && size >= 1024);
@@ -311,7 +325,7 @@ static int mem_write(libusb_device_handle *handle, uint64_t address, const unsig
 	uint32_t args[3] = { (uint32_t)address, (uint32_t)(address >> 32), size };
 	unsigned char reply[8];
 	uint32_t reply_size = sizeof(reply);
-	int res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 3, data, size, 0, reply, &reply_size, NULL);
+	int res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 3, data, size, 0, 8, reply, &reply_size, NULL);
 	if (res == 0 && (reply_size < 8 || get32(reply + 4) != 0)) {
 		usbmuxd_log(LL_ERROR, "KIS RSM: memory write to 0x%llx failed, status 0x%x", (unsigned long long)address, reply_size < 8 ? 0 : get32(reply + 4));
 		res = LIBUSB_ERROR_IO;
@@ -329,9 +343,12 @@ static int mem_read(libusb_device_handle *handle, uint64_t address, uint32_t siz
 	if (!reply)
 		return LIBUSB_ERROR_NO_MEM;
 	put32(payload, size);
-	res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 2, payload, 4, 0, reply, &reply_size, NULL);
-	if (res == 0 && (reply_size < size + 8 || get32(reply + size + 4) != 0))
+	res = kis_request(handle, KIS_PORTAL_RSM, KIS_INDEX_MEMORY, args, 2, payload, 4, 0, size + 8, reply, &reply_size, NULL);
+	if (res == 0 && (reply_size < size + 8 || get32(reply + size + 4) != 0)) {
+		usbmuxd_log(LL_ERROR, "KIS RSM: memory read of %u bytes at 0x%llx failed: %u-byte reply, status 0x%x", size,
+			(unsigned long long)address, reply_size, reply_size >= size + 8 ? get32(reply + size + 4) : 0);
 		res = LIBUSB_ERROR_IO;
+	}
 	if (res == 0)
 		memcpy(out, reply, size);
 	free(reply);
@@ -342,14 +359,14 @@ static int doorbell_write(libusb_device_handle *handle, int doorbell, uint32_t v
 {
 	unsigned char reply[8];
 	uint32_t reply_size = sizeof(reply);
-	return kis_request(handle, KIS_PORTAL_RSM, (uint16_t)(KIS_INDEX_DOORBELLS + doorbell), &value, 1, NULL, 0, 1, reply, &reply_size, NULL);
+	return kis_request(handle, KIS_PORTAL_RSM, (uint16_t)(KIS_INDEX_DOORBELLS + doorbell), &value, 1, NULL, 0, 1, 0, reply, &reply_size, NULL);
 }
 
 static int config_write(libusb_device_handle *handle, uint16_t index, uint32_t value)
 {
 	unsigned char reply[8];
 	uint32_t reply_size = sizeof(reply);
-	return kis_request(handle, KIS_PORTAL_CONFIG, index, &value, 1, NULL, 0, 1, reply, &reply_size, NULL);
+	return kis_request(handle, KIS_PORTAL_CONFIG, index, &value, 1, NULL, 0, 1, 0, reply, &reply_size, NULL);
 }
 
 static int find_channel(const uint32_t *bells, int type)
