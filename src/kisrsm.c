@@ -778,6 +778,19 @@ static int find_usbmux_endpoints(struct kisrsm_dev *dev, const unsigned char *d,
 	return (dev->ep_in && dev->ep_out) ? 0 : -1;
 }
 
+/* "class/subclass/protocol" of each interface in a configuration descriptor, for the log. */
+static void describe_interfaces(const unsigned char *d, int length, char *out, size_t out_size)
+{
+	int pos = 0;
+	size_t used = 0;
+	out[0] = 0;
+	while (pos + 2 <= length && d[pos] >= 2 && used + 12 < out_size) {
+		if (d[pos + 1] == 4 && pos + 9 <= length)
+			used += (size_t)snprintf(out + used, out_size - used, "%s%02x/%02x/%02x", used ? " " : "", d[pos + 5], d[pos + 6], d[pos + 7]);
+		pos += d[pos];
+	}
+}
+
 static void ascii_string(const unsigned char *d, int length, char *out, size_t out_size)
 {
 	size_t n = 0;
@@ -827,8 +840,14 @@ static void enum_done(struct kisrsm_dev *dev, int index)
 			dev->config_total = sizeof(dev->ctrl_data);
 		break;
 	case 2:
-		if (find_usbmux_endpoints(dev, dev->ctrl_data, dev->ctrl_len) != 0)
+		if (find_usbmux_endpoints(dev, dev->ctrl_data, dev->ctrl_len) != 0) {
+			/* also seen when a Mac boots normally (MacBook Neo: 05ac:1905); logged to tell the two apart */
+			char interfaces[128];
+			describe_interfaces(dev->ctrl_data, dev->ctrl_len, interfaces, sizeof(interfaces));
+			usbmuxd_log(LL_INFO, "KIS RSM: device %04x:%04x on channel %d (descriptor 0x%08x) has interfaces %s",
+				dev->devdesc.idVendor, dev->devdesc.idProduct, dev->ch, dev->desc, interfaces[0] ? interfaces : "none");
 			fail(dev, "no usbmux interface in configuration 1");
+		}
 		else
 			usbmuxd_log(LL_INFO, "KIS RSM: usbmux endpoints %02x/%02x", dev->ep_out, dev->ep_in);
 		break;
@@ -1094,6 +1113,18 @@ static struct kisrsm_dev *probe(libusb_device *device)
 	usbmuxd_log(LL_NOTICE, "KIS RSM: restore channel %d on device %d-%d (H2D 0x%llx, D2H 0x%llx)", ch,
 		libusb_get_bus_number(device), libusb_get_device_address(device),
 		(unsigned long long)dev->h2d, (unsigned long long)dev->d2h);
+	/* The doorbell file before bring-up, to learn what tells a restore channel from the one a Mac offers
+	 * while it boots normally (MacBook Neo: device 05ac:1905 instead of the restore device 05ac:12ac). */
+	char words[16 * 9 + 1];
+	int i;
+	size_t used = 0;
+	for (i = 1; i < 16; i++)
+		used += (size_t)snprintf(words + used, sizeof(words) - used, "%s%08x", i > 1 ? " " : "", bells[i]);
+	usbmuxd_log(LL_INFO, "KIS RSM: doorbells 1-15: %s", words);
+	used = 0;
+	for (i = 0; i < 16; i++)
+		used += (size_t)snprintf(words + used, sizeof(words) - used, "%s%08x", i ? " " : "", bells[DB_CHAN_DESC + i]);
+	usbmuxd_log(LL_INFO, "KIS RSM: channel descriptors: %s", words);
 	return dev;
 }
 
