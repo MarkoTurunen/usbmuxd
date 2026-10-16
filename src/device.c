@@ -275,6 +275,10 @@ static int send_anon_rst(struct mux_device *dev, uint16_t sport, uint16_t dport,
 	return res;
 }
 
+/* One line per data or ACK packet is a flood (a 45-minute restore logged 1.7 million): those need -v -v -v
+ * in the foreground. Packets that open or close a connection stay at debug level. */
+#define PACKET_LOG_LEVEL(flags) (((flags) & (TH_SYN | TH_FIN | TH_RST)) ? LL_DEBUG : LL_SPEW)
+
 static int send_tcp(struct mux_connection *conn, uint8_t flags, const unsigned char *data, int length)
 {
 	struct tcphdr th;
@@ -287,7 +291,7 @@ static int send_tcp(struct mux_connection *conn, uint8_t flags, const unsigned c
 	th.th_off = sizeof(th) / 4;
 	th.th_win = htons(conn->tx_win >> 8);
 
-	usbmuxd_log(LL_DEBUG, "[OUT] dev=%d sport=%d dport=%d seq=%d ack=%d flags=0x%x window=%d[%d] len=%d",
+	usbmuxd_log(PACKET_LOG_LEVEL(flags), "[OUT] dev=%d sport=%d dport=%d seq=%d ack=%d flags=0x%x window=%d[%d] len=%d",
 		conn->dev->id, conn->sport, conn->dport, conn->tx_seq, conn->tx_ack, flags, conn->tx_win, conn->tx_win >> 8, length);
 
 	int res = send_packet(conn->dev, MUX_PROTO_TCP, &th, data, length);
@@ -641,7 +645,7 @@ static void device_tcp_input(struct mux_device *dev, struct tcphdr *th, unsigned
 	uint16_t dport = ntohs(th->th_sport);
 	struct mux_connection *conn = NULL;
 
-	usbmuxd_log(LL_DEBUG, "[IN] dev=%d sport=%d dport=%d seq=%d ack=%d flags=0x%x window=%d[%d] len=%d",
+	usbmuxd_log(PACKET_LOG_LEVEL(th->th_flags), "[IN] dev=%d sport=%d dport=%d seq=%d ack=%d flags=0x%x window=%d[%d] len=%d",
 		dev->id, dport, sport, ntohl(th->th_seq), ntohl(th->th_ack), th->th_flags, ntohs(th->th_win) << 8, ntohs(th->th_win), payload_length);
 
 	if(dev->state != MUXDEV_ACTIVE) {

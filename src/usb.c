@@ -1240,10 +1240,12 @@ int usb_init(void)
 		return -1;
 	}
 
+	/* libusb's debug output traces every event loop pass (gigabytes per hour while a device restores), so it
+	 * needs -v -v -v in the foreground; usbmuxd's own debug lines come at -v -v. */
 #if LIBUSB_API_VERSION >= 0x01000106
-	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
+	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, (log_level >= LL_SPEW ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
 #else
-	libusb_set_debug(NULL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
+	libusb_set_debug(NULL, (log_level >= LL_SPEW ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
 #endif
 
 	collection_init(&device_list);
