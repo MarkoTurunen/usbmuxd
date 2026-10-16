@@ -76,6 +76,7 @@ struct kis_candidate {
 	struct timeval next_probe;
 	struct kisrsm_dev *engine;
 	struct usb_device *usbdev;
+	int not_restore; /* offers no restore device until it reconnects */
 };
 #define KIS_PROBE_INTERVAL 1000
 static struct collection kis_list;
@@ -1032,6 +1033,8 @@ static void kis_process(void)
 	struct timeval now;
 	FOREACH(struct kis_candidate *c, &kis_list) {
 		if(!c->engine) {
+			if(c->not_restore)
+				continue;
 			get_tick_count(&now);
 			if(now.tv_sec < c->next_probe.tv_sec || (now.tv_sec == c->next_probe.tv_sec && now.tv_usec < c->next_probe.tv_usec))
 				continue;
@@ -1072,6 +1075,12 @@ static void kis_process(void)
 				device_remove(usbdev);
 				usb_disconnect(usbdev);
 			} else {
+				if(kisrsm_not_restore_device(c->engine)) {
+					/* A Mac that booted normally keeps its KIS device; probing it again would only find
+					 * the channel we just took. A restore starts from DFU, so the device reconnects. */
+					c->not_restore = 1;
+					usbmuxd_log(LL_NOTICE, "KIS RSM: leaving KIS device %d-%d alone until it reconnects", c->bus, c->address);
+				}
 				kisrsm_free(c->engine);
 				c->engine = NULL;
 				kis_schedule_probe(c, 2000);

@@ -146,6 +146,7 @@ struct kisrsm_dev {
 	uint64_t next_stats_ms, next_peek_ms;
 	unsigned long push_bytes;
 	int push_ep_failed;
+	int not_restore; /* the channel tunnels a device without usbmux (a Mac booting normally) */
 	int close_error;        /* ended by a failed request rather than by the device */
 	uint64_t starved_since; /* data waiting with no credit and no open buffer since (0: not waiting) */
 	int stall_reported;
@@ -844,9 +845,11 @@ static void enum_done(struct kisrsm_dev *dev, int index)
 			/* also seen when a Mac boots normally (MacBook Neo: 05ac:1905); logged to tell the two apart */
 			char interfaces[128];
 			describe_interfaces(dev->ctrl_data, dev->ctrl_len, interfaces, sizeof(interfaces));
-			usbmuxd_log(LL_INFO, "KIS RSM: device %04x:%04x on channel %d (descriptor 0x%08x) has interfaces %s",
-				dev->devdesc.idVendor, dev->devdesc.idProduct, dev->ch, dev->desc, interfaces[0] ? interfaces : "none");
-			fail(dev, "no usbmux interface in configuration 1");
+			usbmuxd_log(LL_NOTICE, "KIS RSM: device %04x:%04x on channel %d (descriptor 0x%08x) is not a restore device "
+				"(interfaces %s)", dev->devdesc.idVendor, dev->devdesc.idProduct, dev->ch, dev->desc,
+				interfaces[0] ? interfaces : "none");
+			dev->not_restore = 1;
+			dev->step = ST_FAILED;
 		}
 		else
 			usbmuxd_log(LL_INFO, "KIS RSM: usbmux endpoints %02x/%02x", dev->ep_out, dev->ep_in);
@@ -1257,6 +1260,11 @@ int kisrsm_max_packet_size(struct kisrsm_dev *dev)
 {
 	(void)dev;
 	return 512;
+}
+
+int kisrsm_not_restore_device(struct kisrsm_dev *dev)
+{
+	return dev && dev->not_restore;
 }
 
 void kisrsm_free(struct kisrsm_dev *dev)

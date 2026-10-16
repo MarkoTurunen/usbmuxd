@@ -55,6 +55,11 @@ const char *kisrsm_serial(struct kisrsm_dev *dev);
 libusb_device_handle *kisrsm_handle(struct kisrsm_dev *dev);
 int kisrsm_max_packet_size(struct kisrsm_dev *dev);
 
+/* Nonzero when the channel closed because it tunnels a device without a usbmux interface: the one a
+ * MacBook Neo offers while it boots macOS normally (05ac:1905). Not worth probing again until the KIS
+ * device reconnects. */
+int kisrsm_not_restore_device(struct kisrsm_dev *dev);
+
 /* Releases the KIS device and frees the engine (queued data is dropped). */
 void kisrsm_free(struct kisrsm_dev *dev);
 
