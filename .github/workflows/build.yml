@@ -75,3 +75,4 @@ jobs:
       with:
         name: usbmuxd-latest_${{env.target_triplet}}
         path: usbmuxd.tar
+        retention-days: 3
